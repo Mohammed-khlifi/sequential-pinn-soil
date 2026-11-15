@@ -1,0 +1,30 @@
+# Source only: no data, checkpoints or run outputs
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+runs/
+*.pt
+*.pth
+*.ckpt
+*.npy
+*.npz
+*.nc
+*.bin
+*.txt
+!Training/SPINN_old_version.txt
+*.log
+
+# Only these top-level entries are versioned; everything else stays local.
+/*
+!/.gitignore
+!/README.md
+!/Infitration_training.py
+!/Infitration_training_original.py
+!/Metrics_script.py
+!/Timestep_test.py
+!/Data_assimilation _test.py
+!/paths.py
+!/configs/
+!/Training/
+!/Models/
+!/utils/

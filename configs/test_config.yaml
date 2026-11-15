@@ -1,0 +1,39 @@
+soil: Loam
+seed: 0
+output_dir: runs/test_run
+
+grid:
+  Nx: 101
+  Nz: 101
+  Nt: 51
+  t_max: 30.0
+
+bc:
+  hb: -10.0
+  hg: 2.0
+  x_infiltration_range: 26   # top boundary length is 1 m, water infiltrates only in the first quarter
+
+model:
+  in_channels: 3
+  width: 128
+  depth: 6
+  dropout: 0.0
+  groups: 32
+
+optim:
+  lr_first: 1.0e-3     # keep the decimal point: PyYAML reads 1e-3 as a string
+  lr_others: 1.0e-4
+  weight_decay: 1.0e-4
+  step_size: 5000
+  gamma: 0.95
+
+train:
+  epochs_max: 10
+  epochs: 10
+  E_max: 10
+  tol: 1.0e-40
+  loss_min: 1.0e-2
+  loss_max: 1.0e-3
+  regularization: 0.5
+  adaptive_weights: false
+  data_loss: false

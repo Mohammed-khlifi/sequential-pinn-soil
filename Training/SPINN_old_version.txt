@@ -1,0 +1,484 @@
+@dataclass(frozen=True)
+class _BoundarySpec:
+    """Internal helper to clarify boundary condition intent."""
+    kind: str              # "dirichlet" or "neumann" (case-insensitive)
+    value: Optional[torch.Tensor]
+
+
+@dataclass(frozen=True)
+class _Subdomain:
+    """Internal helper to clarify (nt, dt) specification for subdomains."""
+    nt: int
+    dt: float
+
+
+class SPINNTrainer:
+    """
+    Sequential Physics‑Informed Neural Network (SPINN) trainer.
+
+    Parameters
+    ----------
+    K : callable
+        Hydraulic conductivity K(h, z). Signature: K(h_pred, z) -> Tensor[Nz].
+    C : callable
+        Capacity (or specific moisture capacity) C(h, z) used when form='mixte'.
+    theta : callable
+        Water content theta(h, z). Signature: theta(h, z) -> Tensor[Nz].
+    models : list
+        List of PyTorch models, one per time step (Nt-1). Each model should accept
+        (T[n], z, h_old) and return h_pred over z.
+    optimizers : list
+        List of torch.optim.Optimizer, one per time step, aligned with `models`.
+    schedulers : list
+        Optional schedulers (kept to mirror your API). Not invoked here by design,
+        consistent with your original code (the call was commented out).
+    discritization : str
+        Discretization type: 'normal' (default), 'hybrid', or 'autograd'.
+        (Name preserved as in original code.)
+    form : str
+        PDE form: 'theta' or 'mixte' (original spelling preserved).
+    device : str
+        Torch device string.
+    """
+
+    # ---------------------------- Initialization ---------------------------- #
+
+    def __init__(
+        self,
+        K: Callable,
+        C: Callable,
+        theta: Callable,
+        models: List[nn.Module],
+        optimizers: List[torch.optim.Optimizer],
+        schedulers: List[Any],
+        discritization: str = 'normal',
+        form: str = 'theta',
+        device: str = 'cpu',
+    ):
+        # Hydrodynamic features (user-supplied callables)
+        self.K = K
+        self.C = C
+        self.theta = theta
+
+        # PDE form & space discretization (names preserved)
+        self.discritization = discritization
+        self.form = form
+
+        # Models/optimizers
+        self.models = models
+        self.optimizers = optimizers
+        self.schedulers = schedulers
+        self.device = device
+
+        # Trackers
+        self.loss_tracker: Dict[int, List[float]] = {i: [] for i in range(len(models))}
+        self.epochs_count: List[Tuple[int, int]] = []
+        self.solution: List[torch.Tensor] = []
+
+        # Internal state placeholders (populated during training)
+        self.h_old: Optional[torch.Tensor] = None  # shape [Nz, 1]
+        self.h_pred: Optional[torch.Tensor] = None
+        self.loss: Optional[torch.Tensor] = None
+        self.L_phys = 0.0
+        self.L_bnd1 = 0.0
+        self.L_bnd2 = 0.0
+
+        # Adaptive loss weights (declared on demand)
+        self.w1: Optional[torch.Tensor] = None
+        self.w2: Optional[torch.Tensor] = None
+        self.w3: Optional[torch.Tensor] = None
+
+        # Subdomain state
+        self.subdomains: List[Tuple[int, float]] = []
+        self.j: int = 0
+        self.nt_sub: Optional[int] = None
+        self.dt_sub: Optional[float] = None
+
+        # Early divergence state
+        self._patience: int = 0
+        self._max_patience: int = 0
+
+        # Closure args container used inside train_one_epoch (mirrors your pattern)
+        self.args: Tuple[Any, ...] = tuple()
+
+    # ------------------------------ Training ------------------------------- #
+
+    def train(
+        self,
+        T: torch.Tensor,
+        z: torch.Tensor,
+        epochs: int = 1000,
+        epochs_max: int = int(1e4),
+        E_max: int = int(2e4),
+        tol: float = 1e-15,
+        loss_max: float = 1e-6,
+        loss_min: float = 1e-4,
+        max_patience: int = 10,
+        subdomains: List[Tuple[int, float]] = (),
+        h_init: Optional[torch.Tensor] = None,
+        h_top: Tuple[str, Optional[torch.Tensor]] = ("Dirichlet", None),
+        h_bottom: Tuple[str, Optional[torch.Tensor]] = ("Dirichlet", None),
+        adaptive_weights: bool = False,
+    ) -> torch.Tensor:
+        """
+        Train PINN models sequentially in time.
+
+        Notes keep parity with original code:
+        - `T` has shape [Nt, Nz]; `z` has shape [Nz].
+        - One model per time step; `models[n]` predicts h at step n+1 using input at n.
+        - Adaptive loss weights are optional and (if enabled) are added to the optimizer
+          param group of the **current** time-step model.
+
+        Early stop: stops an individual time-step when (∆h < tol) or (loss < loss_max),
+        can extend E by `epochs` up to `epochs_max` if still > loss_min.
+        """
+        Nt, Nz = T.shape
+
+        # Initialize "head"/state with initial condition h(z, t=0)
+        # Original shape behavior preserved: keep an extra trailing singleton dim.
+        self.h_old = h_init.unsqueeze(-1)  # [Nz, 1]
+        self.solution = [self.h_old]       # keep time-ordered list of [Nz, 1] tensors
+
+        # Subdomains bookkeeping (list of tuples kept for parity)
+        self.subdomains = list(subdomains) if subdomains else []
+        self.j = 0
+        if self.subdomains:
+            self.nt_sub, self.dt_sub = self.subdomains[self.j]
+        else:
+            # If no subdomains provided, we won't use nt_sub/dt_sub logic.
+            self.nt_sub, self.dt_sub = 10**9, 1.0  # harmless large/defaults
+
+        # Patience control for divergence
+        self._max_patience = max_patience
+        self._patience = 0
+
+        print_every_epoch = 100  # consistent with print_evolution default
+
+        # --------- time stepping --------- #
+        for n in range(0, Nt - 1):
+            try:
+                previous_h = self.h_old.clone()
+                theta_old = self.theta(self.h_old.squeeze(), z)
+
+                # Epoch budget for this time slice
+                if n == 0:
+                    E = E_max
+                    self.w1, self.w2, self.w3 = self.adaptive_weights_init()
+                else:
+                    E = epochs
+
+                if adaptive_weights:
+                    # attach weights to current optimizer param group
+                    self.optimizers[n].add_param_group({
+                        'params': [self.w1, self.w2, self.w3],
+                        'lr': 0.001,
+                    })
+
+                print(f"itteration {n}")
+                epoch = 0
+
+                # Pack closure args (mirror original tuple)
+                self.args = (theta_old, h_top, h_bottom, T, z, n)
+
+                old_loss_val = float('inf')
+                self._patience = 0  # reset for this time-slice
+
+                while epoch < E:
+                    # The optimizer calls our closure (train_one_epoch) internally.
+                    self.optimizers[n].step(self.train_one_epoch)
+
+                    # Stop criteria (unchanged logic)
+                    stop = self.check_stop_condition(
+                        n, epoch, previous_h, E, epochs_max, loss_min, loss_max, tol
+                    )
+                    if stop is True:
+                        break
+                    elif stop is False:
+                        # extend budget by `epochs` (parity with original)
+                        E += epochs
+
+                    # Divergence check (same intent as your original)
+                    diverging_or_loss = self.check_divergence(old_loss_val)
+                    if diverging_or_loss is True:
+                        break
+                    else:
+                        # When not diverging, method returns the current loss tensor
+                        # Keep a scalar value to compare next iteration.
+                        old_loss_val = float(diverging_or_loss.detach().cpu().item())
+
+                    previous_h = self.h_pred.clone()
+                    epoch += 1
+
+                    self.print_evolution(epoch, rate=print_every_epoch)
+
+                # Bookkeeping for this time step
+                self.epochs_counter(n, epoch)
+                self.update_head(n)  # advances h_old and copies weights forward
+
+            except Exception:
+                # Original message preserved
+                print(f"an Error has occured , the evolution level is {n+1}")
+                break
+
+        # Stack solution along time dimension: [Nz, Nt, 1] -> keep original dim=1
+        self.solution = torch.stack(self.solution, dim=1)
+        return self.solution
+
+    # ------------------------------ One epoch ------------------------------ #
+
+    def train_one_epoch(self) -> torch.Tensor:
+        """
+        Closure that a PyTorch optimizer can call. Computes loss and backward pass.
+        Expects self.args = (theta_old, h_top, h_bottom, T, z, n)
+        """
+        theta_old, h_top, h_bottom, T, z, n = self.args
+        self.models[n].train()
+        self.optimizers[n].zero_grad()
+
+        # Forward: predict h at next time using current model/head
+        h_pred = self.models[n](T[n], z, self.h_old).squeeze()          # [Nz]
+        theta_vec = self.theta(h_pred, z)                               # [Nz]
+
+        # Backward difference in time for theta
+        theta_t = self.calculate_theta_t(n, h_pred, theta_old)          # [Nz]
+
+        # Physics residual loss
+        L_phys = self.physics_loss(h_pred, theta_t, z, discritization=self.discritization)
+
+        # Boundary losses (top & bottom)
+        htop = _BoundarySpec(h_top[0], h_top[1])
+        hbot = _BoundarySpec(h_bottom[0], h_bottom[1])
+
+        if htop.kind.lower() == "dirichlet":
+            L_bnd1 = self.boundary_loss(h_pred[0], htop.value)
+        elif htop.kind.lower() == "neumann":
+            L_bnd1 = self.Neuman_boundary_loss(h_pred, htop.value, z)
+        else:
+            raise TypeError("Boundary type is not valid")
+
+        if hbot.kind.lower() == "dirichlet":
+            L_bnd2 = self.boundary_loss(h_pred[-1], hbot.value)
+        elif hbot.kind.lower() == "neumann":
+            L_bnd2 = self.Neuman_boundary_loss(h_pred, hbot.value, z)
+        else:
+            raise TypeError("Boundary type is not valid")
+
+        # Total loss (adaptive combination)
+        loss = self.adaptive_loss(L_phys, L_bnd1, L_bnd2)
+
+        # Track & backprop
+        self.Loss_tracker(itteration=n, loss=loss)
+        loss.backward(retain_graph=True)
+
+        # Save current scalars for logs; detach h_pred for head update later
+        self.loss = loss
+        self.L_phys = float(L_phys.item())
+        self.L_bnd1 = float(L_bnd1.item())
+        self.L_bnd2 = float(L_bnd2.item())
+        self.h_pred = h_pred.detach()
+
+        return loss
+
+    # ------------------------------- Losses -------------------------------- #
+
+    def adaptive_loss(self, L_phys: torch.Tensor, L_bnd1: torch.Tensor, L_bnd2: torch.Tensor) -> torch.Tensor:
+        """
+        Adaptive total loss (weights are trainable scalars w_i as in your original).
+        """
+        # Keep your original exact expression (split across lines for clarity only)
+        loss = (
+            torch.exp(-self.w1) * L_phys
+            + torch.exp(-self.w2) * L_bnd1
+            + torch.exp(-self.w3) * L_bnd2
+            + 0.5 * (torch.abs(self.w1) + torch.abs(self.w2) + torch.abs(self.w3))
+        )
+        return loss
+
+    def physics_loss(
+        self,
+        h_pred: torch.Tensor,
+        theta_t: torch.Tensor,
+        z: torch.Tensor,
+        discritization: str = 'normal',
+    ) -> torch.Tensor:
+        """
+        Compute physics residual loss R = theta_t - div(K * (grad h - 1)) in 1D z,
+        using the chosen discrete scheme. Returns MSE of residual to zero.
+        """
+        dz = (z[1] - z[0])
+        Kvec = self.K(h_pred, z).squeeze()
+
+        if discritization.lower() == 'normal':
+            # first-order finite volume-like flux difference
+            Kmid = 0.5 * (Kvec[:-1] + Kvec[1:])
+            h_z_forward = (h_pred[1:-1] - h_pred[:-2]) / dz
+            h_z_backward = (h_pred[2:] - h_pred[1:-1]) / dz
+            dflux = (1 / dz) * (Kmid[1:] * (h_z_backward - 1) - Kmid[:-1] * (h_z_forward - 1))
+            R = theta_t[1:-1] - dflux
+
+        elif discritization.lower() == 'hybrid':
+            # centered derivatives
+            h_z = (h_pred[2:] - h_pred[:-2]) / (2 * dz)
+            K_z = (Kvec[2:] - Kvec[:-2]) / (2 * dz)
+            h_zz = (h_pred[2:] - 2 * h_pred[1:-1] + h_pred[:-2]) / (dz ** 2)
+            dflux = K_z * (h_z - 1) + Kvec[1:-1] * h_zz
+            R = theta_t[1:-1] - dflux
+
+        elif discritization.lower() == 'autograd':
+            # automatic differentiation in z
+            h_z = self.grad_auto(h_pred, z=z)
+            Iflux = Kvec * (h_z - 1)
+            dflux = self.grad_auto(Iflux, z=z)
+            R = theta_t[1:-1] - dflux[1:-1]
+
+        else:
+            raise ValueError(f"Unknown discritization='{discritization}'")
+
+        return F.mse_loss(R.squeeze(), torch.zeros_like(R).squeeze())
+
+    def adaptive_weights_init(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Initialize trainable log-weights (exactly as in your original)."""
+        w1 = torch.tensor(0.0, requires_grad=True, device=self.device)
+        w2 = torch.tensor(0.0, requires_grad=True, device=self.device)
+        w3 = torch.tensor(0.0, requires_grad=True, device=self.device)
+        return w1, w2, w3
+
+    # ----- Boundary helpers (kept with your names/signatures for parity) ---- #
+
+    def boundary_losses(self, h_pred: torch.Tensor, h_top: torch.Tensor, h_init: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """(Unused in core flow; kept for parity with your original.)"""
+        L_bnd1 = F.mse_loss(h_pred[0].squeeze(), h_top.squeeze())
+        L_bnd2 = F.mse_loss(h_pred[-1].squeeze(), h_init.squeeze())
+        return L_bnd1, L_bnd2
+
+    def boundary_loss(self, h_pred: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
+        """Dirichlet boundary loss at a single location."""
+        return F.mse_loss(h_pred.squeeze(), value.squeeze())
+
+    def Neuman_boundary_loss(self, h_pred: torch.Tensor, value: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+        """
+        Neumann boundary at the top (flux-based). Uses your original 1-sided estimate.
+        """
+        dz = (z[1] - z[0])
+        Kvec = self.K(h_pred, z).squeeze()
+        q_pred = -Kvec[0] * (((h_pred[1] - h_pred[0]) / dz) - 1.0)
+        return F.mse_loss(q_pred, value)
+
+    # -------------------------- Time derivative θ_t ------------------------- #
+
+    def calculate_theta_t(self, n: int, h_pred: torch.Tensor, theta_old: torch.Tensor) -> torch.Tensor:
+        """
+        Compute backward difference in time for theta (or mixed form via C(h) dh/dt).
+        NOTE: Accesses `z` from `self.args` to keep signature identical to your original.
+        """
+        # Unpack z from pre-set args (you already store it there)
+        _, _, _, _, z, _ = self.args
+        theta_vec = self.theta(h_pred, z)
+
+        if n < (self.nt_sub + 1):
+            dt = self.dt_sub
+        else:
+            # progress to next subdomain
+            nt_sub_c, self.dt_sub = self.subdomains[self.j + 1]
+            self.nt_sub += nt_sub_c
+            dt = self.dt_sub
+            self.j += 1
+
+        if self.form.lower() == 'theta':
+            theta_t = (theta_vec - theta_old) / dt
+        elif self.form.lower() == 'mixte':
+            theta_t = self.C(h_pred, z) * ((h_pred - self.h_old.squeeze()) / dt)
+        else:
+            raise ValueError(f"{self.form.lower()} is not valid")
+
+        return theta_t
+
+    # ------------------------- Training utilities -------------------------- #
+
+    def check_divergence(self, old_loss: float) -> torch.Tensor | bool:
+        """
+        Detect monotone loss increase across epochs and stop if patience exceeded.
+        Returns:
+            True  -> divergence triggered
+            loss  -> current loss tensor (also used to update old_loss outside)
+        """
+        if self.loss.item() > old_loss:
+            if self._patience < self._max_patience:
+                self._patience += 1
+            else:
+                print('the loss is diverging')
+                return True
+        else:
+            self._patience = 0
+        return self.loss
+
+    def print_evolution(self, epoch: int, rate: int = 100) -> None:
+        """Console progress log (same presentation as your original)."""
+        if (epoch % rate) == 0:
+            print(
+                f"epoch {epoch:4d}  loss={self.loss:.2e} , "
+                f"L_phys={self.L_phys:.2e} , L_bnd1={self.L_bnd1:.2e}, L_bnd2={self.L_bnd2:.2e}"
+            )
+
+    def check_stop_condition(
+        self,
+        n: int,
+        epoch: int,
+        previous_h: torch.Tensor,
+        E: int,
+        epochs_max: int,
+        loss_min: float,
+        loss_max: float,
+        tol: float
+    ) -> Optional[bool]:
+        """
+        Mirrors your original logic: stop if solution change < tol or loss < loss_max.
+        If epoch budget `E` ends with loss > loss_min and `E` < `epochs_max`, signal
+        to extend the budget by returning False.
+        """
+        if F.mse_loss(self.h_pred, previous_h.squeeze()) < tol or self.loss < loss_max:
+            var = F.mse_loss(self.h_pred.squeeze(), previous_h.squeeze())
+            print(f"epoch {epoch:4d}, itteration {n+1}  loss={self.loss.item():.2e} , variance={var:.2e}")
+            return True
+        elif (epoch == E - 1) and (self.loss > loss_min) and (E < epochs_max):
+            return False  # caller will extend E by `epochs`
+
+        return None
+
+    def update_head(self, n: int) -> None:
+        """
+        After finishing time step n:
+        - Set h_old <- h_pred for next step.
+        - Append head to solution.
+        - Copy learned weights to the next model to warm start.
+        """
+        with torch.no_grad():
+            self.models[n].eval()
+            self.h_old = self.h_pred.detach().clone().unsqueeze(-1)  # [Nz, 1]
+            self.solution.append(self.h_pred.unsqueeze(-1))          # store time slice
+            if n + 1 < len(self.models):
+                self.models[n + 1].load_state_dict(self.models[n].state_dict())
+
+    def Loss_tracker(self, itteration: int, loss: torch.Tensor) -> None:
+        """Track loss evolution for each time step (API preserved)."""
+        self.loss_tracker[itteration].append(float(loss.item()))
+
+    def epochs_counter(self, itteration: int, ep_final: int) -> None:
+        """Record number of epochs used at each time step (API preserved)."""
+        self.epochs_count.append((itteration, ep_final))
+
+    def grad_auto(self, outputs: torch.Tensor, z: Optional[torch.Tensor] = None, t: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Autodiff gradient helper: d(outputs)/d(z) or d(outputs)/d(t) as in your original.
+        """
+        inputs = t if (z is None) else z
+        derivation = torch.autograd.grad(
+            outputs,
+            inputs,
+            grad_outputs=torch.ones_like(outputs),
+            retain_graph=True,
+            create_graph=True,
+            allow_unused=True,
+        )[0]
+        return derivation
+
